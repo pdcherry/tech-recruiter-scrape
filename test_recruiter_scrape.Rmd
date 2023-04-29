@@ -1,0 +1,164 @@
+---
+title: "Test San Francisco Tech Recruiter Scraper"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(readr)
+library(stringr)
+library(rvest)
+library(magrittr)
+library(glue)
+library(purrr)
+library(conflicted)
+conflict_prefer("filter", "dplyr")
+conflict_prefer("here", "here")
+conflict_prefer("collapse", "glue")
+```
+
+# Initial Scrape
+Scrape first page
+```{r}
+link <- "https://candor.co/location/san-francisco-california"
+```
+
+```{r}
+my_html <- read_html(link)
+```
+
+```{r}
+recruiter_name_tbl <-
+  my_html %>%
+  html_nodes(".RecruiterList_list__L18E9") %>%
+  html_text2() %>%
+  str_split("\\n") %>%
+  tibble::as_tibble(.name_repair = "universal") %>%
+  rename("full_name" = 1) %>%
+  mutate("first_name" = str_remove_all(str_extract(full_name, "^[[:alpha:]-]+"), "-"),
+         "last_name" = str_remove_all(str_extract(full_name, "(?<=^[[:alpha:]-]{0,11} )[[:alpha:]-]+"), "-"))
+```
+```{r}
+recruiter_name_tbl %>%
+  mutate(first_name_length = str_length(`first_name`)) %>%
+  summarize(max(first_name_length))
+```
+## NAs check
+We expect 6 NAs in the last name column based on the website and the six missing last names.
+
+```{r}
+recruiter_name_tbl %>%
+  summarize(across(.fns = ~sum(is.na(.x))), "n" = n())
+```
+
+```{r}
+recruiter_urls <-
+  recruiter_name_tbl %>%
+  mutate("url_suffix" = str_to_lower(str_glue("{first_name}-{last_name}", .na = "")),
+         "candor_url" = str_replace_all(str_glue("https://candor.co/recruiter/{url_suffix}"),
+                                        c("ć" = "", "á" = "")))
+```
+
+```{r,eval = FALSE}
+write_csv(recruiter_urls, "2022_06_02-Candor_San_Francisco_Bay_Area_recruiters.csv")
+```
+
+```{r}
+recruiter_urls %>%
+  mutate("non_ascii" = str_detect(
+    str_to_lower(str_glue("{first_name}{last_name}", .na = "")),
+    "[^a-z]")) %>%
+  count(non_ascii)
+```
+
+```{r}
+recruiter_urls %>%
+  mutate("non_ascii" = str_detect(
+    str_to_lower(str_glue("{first_name}{last_name}", .na = "")),
+    "[^a-z]")) %>%
+  filter(non_ascii == TRUE)
+```
+
+# Crawl all recruiter pages
+### Explore function
+```{r}
+recruit_html <- read_html("https://candor.co/recruiter/marissa-aguilera")
+
+recruiter_position_text <- recruit_html %>%
+  html_nodes(".subhead._slug__profileByline__QsDkP") %>%
+  html_text()
+```
+
+### Define Function
+```{r}
+get_connections <- function(uri){
+  
+  showConnections(all = TRUE) %>%
+    as.data.frame %>%
+    rownames_to_column('con_id') %>%
+    filter(description == uri) %>%
+    pull(con_id) %>%
+    as.integer %>%
+    map(getConnection)
+}
+
+close_connection <- function(uri){
+  
+  uri %>%
+    get_connections %>%
+    walk(close)
+}
+```
+
+```{r}
+crawl_recruiter_fun <- function(page_url){
+  
+  recruit_html <- read_html(page_url,
+                            RECOVER = TRUE)
+  
+  print(page_url)
+  
+  recruiter_position_text <- recruit_html %>%
+    html_nodes(".subhead._slug__profileByline__QsDkP") %>%
+    html_text()
+  
+  # Sys.sleep(3)
+  # 
+  # on.exit(close_connection(page_url))
+  
+  return(recruiter_position_text)
+}
+```
+
+## Map/Apply Function over URLs in Dataframe
+```{r echo = TRUE, eval = TRUE, include = FALSE}
+recruiter_info <-
+  recruiter_urls %>%
+  mutate("recruiter_location" = map(candor_url, crawl_recruiter_fun))
+```
+
+```{r}
+write_csv(recruiter_info, "2022_06_02-Candor_San_Francisco_Bay_Area_recruiters_raw_info.csv")
+```
+
+# Parse location info
+```{r}
+recruiter_parsed <-
+  recruiter_info %>%
+  mutate("company" = str_extract(recruiter_location, "(?<= at ).+(?= ?(•|-) ?(San Francisco)?)")) %>%
+         tidyr::replace_na(list(company = "Apple"))
+```
+
+```{r}
+recruiter_parsed <- recruiter_parsed %>%
+  select(!url_suffix) %>%
+  relocate(company, .after = full_name) %>%
+  relocate(candor_url, .after = everything()) %>%
+  arrange(company, last_name, first_name)
+```
+
+```{r}
+write_csv(recruiter_parsed, "2022_06_02-Candor_San_Francisco_Tech_recruiters_names_companies_urls.csv")
+```
